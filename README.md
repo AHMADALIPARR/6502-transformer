@@ -1,117 +1,72 @@
+![MOS 6502 chip](docs/mos-6502-chip.jpg)
+
 # 6502-TRANSFORMER
 
-A tiny transformer with a **full forward + backward pass**, written in
-**assembly only** — for two vintage CPUs that were never meant to run one.
+A tiny transformer with a full forward + backward pass, in assembly
+only — for two vintage CPUs that were never meant to run one.
 
-- **6502** — the MOS 6502 (NES, C64, Apple II).
-- **AGC** — the Apollo Guidance Computer (lunar descent guidance).
+- **6502** — the MOS 6502 (Apple II, C64, NES).
+- **AGC** — the Apollo Guidance Computer.
 
 Same model, same task, two architectures. Ternary weights everywhere.
 No Python. No C. No libraries. Just assembly.
 
 ## The model
 
-- d_model = 4, seq_len = 2, vocab = 4, 1 layer, 1 attention head, FFN = 4.
-- All weights **ternary** — values in {-1, 0, 1}.
-- Task: tokens `[0, 1]` → predict token `2`. Loss = MSE on the last
-  token's logits vs a one-hot target.
-- Training: SGD with **latent weights**. Each weight keeps a higher-precision
-  latent value; the update is `latent -= grad >> 2` (lr = 1/4), clamped,
-  then re-quantized to {-1, 0, 1} with a dead zone (|latent| ≤ 16 → 0).
-  The dead zone is what produces sparsity.
-- Deterministic. Fixed tiny dataset. Fixed initial weights (in the source).
+d_model = 4, seq_len = 2, vocab = 4, 1 layer, 1 head, FFN = 4.
+All weights ternary (-1, 0, 1). Task: tokens `[0, 1]` → predict token
+`2`. Loss = MSE on the last token's logits. Training = SGD with latent
+weights (update, clamp, re-quantize to ternary with a dead zone).
 
-## The forward pass (both CPUs)
+## How it works
 
-1. **Embedding** — lookup: `X[t] = Emb[token_t]`.
-2. **Q / K / V** — each is a ternary dot product (the user's kernel):
-   `Q = Wq · X`, `K = Wk · X`, `V = Wv · X`.
-3. **Attention scores** — `S[i][j] = Q[i] · K[j]` (general dot product).
-4. **Softmax** — max-subtract, exp lookup table, normalize.
-5. **Attention output** — `O[i] = Σ_j softmax[i][j] · V[j]` (weighted sum).
-6. **FFN + residual** — `H1 = ReLU(W1 · O)`, `H = O + W2 · H1`.
-7. **Logits** — `Logits = Wo · H` (ternary dot product).
-8. **Loss** — MSE vs the one-hot target.
+**Forward:** embedding → Q/K/V (ternary dot products) → scores →
+softmax → attention output → FFN + residual → logits → loss.
 
-## The backward pass (both CPUs)
+**Backward:** gradients through output → FFN (ReLU mask) → attention
+(softmax Jacobian, dQ/dK/dV) → embedding, then the SGD update.
 
-Gradients flow back through every layer:
+**Why ternary:** the 6502 has no multiply. The AGC has no multiply.
+A ternary weight turns a dot product into add / subtract / skip:
+`1` → add, `-1` → subtract, `0` → skip. No multiply needed.
 
-- `dLogits = 2 · (Logits − Target)` (last token only).
-- `dWo` (outer product) → `dH` (transpose dot via gathered columns).
-- `dW2` → `dH1` (transpose dot) → **ReLU mask** (gradient zeroed where
-  `H1 ≤ 0`) → `dW1` → `dO` (residual + FFN path).
-- Attention backward: `dAttnW` and `dV` (weighted sums), the
-  **softmax Jacobian**, then `dQ` and `dK`.
-- `dWq`, `dWk`, `dWv` (outer products with `X`), `dX` (transpose dots
-  from all three projections), `dEmb` (accumulated per token).
-- **SGD update** — latent, clamp, re-quantize, store (all weight matrices).
+## The architecture
 
-Only the last token contributes to the loss, so backprop starts at
-`Logits[1]`. Cross-token gradients still flow: `O[1]` uses `V[0]` and
-`V[1]`, and `S[1][*]` uses `K[0]` and `K[1]`.
-
-## What is omitted (honest gaps)
-
-- **LayerNorm is omitted** on both CPUs. The residual + ReLU carry the
-  signal. LayerNorm (mean, variance, sqrt, divide) is expensive on both
-  architectures and is a documented gap, not a faked one.
-- **AGC embedding is frozen** — `G_X` (embedding gradients) is computed,
-  but the AGC `EMB` table is not updated by SGD. The 6502 embedding
-  *is* updated. This asymmetry is documented in `agc/backward.asm`.
-- **Fixed-point approximations** — softmax uses an exp table; attention
-  rescaling uses shifts (`>>8` for the attention output, `>>4` for score
-  gradients). Gradient *directions* are exact; magnitudes are approximate.
-  Correct for a tiny demo transformer trained by SGD.
-- **Loss may saturate** (16-bit accumulator) for large logits. In practice
-  logits stay small.
-
-## Status
-
-**Written, not executed.** There is no 6502 emulator and no AGC emulator
-on the build VM. The code is written carefully, cross-checked by reading
-(label and memory-map checks), and structured to assemble — but it has
-not been assembled or run. Do not claim it runs until it has been
-assembled and executed and the loss decreases across training iterations.
+Read [`docs/architecture.md`](docs/architecture.md) — about 1,000 words
+on the 6502's architecture, the memory layout, and the little old
+lady's syntax.
 
 ## Repo map
 
 | Path | What it is |
 |------|-----------|
-| `6502/ternary_dot.asm` | **The 6502 kernel.** User-supplied ternary dot product, verbatim. |
-| `6502/math.asm` | MUL8, DOT8, ReLU, quantize, clamp, softmax (exp table), gather-column, ternary-call wrapper. |
-| `6502/forward.asm` | 6502 forward pass. |
-| `6502/backward.asm` | 6502 backward pass + SGD update. |
-| `6502/main.asm` | 6502 entry, INIT (ROM→RAM weights, latent = ternary×64), data, 8-iteration training loop. |
-| `6502/memmap.asm` | 6502 memory map (activations, gradients, counters). |
-| `agc/ternary_squib.asm` | **The AGC kernel.** User-supplied ternary squib, verbatim. |
-| `agc/math.asm` | AGC helpers (MUL8, DIV, exp lookup, ReLU, clamp, quantize). |
-| `agc/forward.asm` | AGC forward pass. |
-| `agc/backward.asm` | AGC backward pass + SGD update. |
-| `agc/main.agc` | AGC entry, memory map, data tables, training loop (3 iterations). |
+| `6502/ternary_dot.asm` | The 6502 kernel — user-supplied ternary dot product, verbatim |
+| `6502/forward.asm` | 6502 forward pass |
+| `6502/backward.asm` | 6502 backward pass + SGD update |
+| `6502/main.asm` | 6502 entry, init, data, training loop |
+| `6502/math.asm` | 6502 helpers (MUL8, DOT8, softmax, quantize) |
+| `agc/ternary_squib.asm` | The AGC kernel — user-supplied ternary squib, verbatim |
+| `agc/forward.asm` | AGC forward pass |
+| `agc/backward.asm` | AGC backward pass + SGD update |
+| `agc/main.agc` | AGC entry, memory map, data, training loop |
+| `docs/architecture.md` | Architecture, memory layout, syntax (~1,000 words) |
 
 ## Building
 
-**6502** — ca65 syntax (cc65 toolchain). Assemble and link with your
-config (the code uses `.segment` / `.org`; provide a linker config that
-defines `CODE` at `$8000` and `VECTORS` at `$FFFA`), then run on a 6502
-emulator or hardware. Watch `LOSS` (`$0304`, 16-bit) — it should decrease
-across the 8 training iterations.
+**6502** — ca65 syntax. Assemble + link (provide a config with `CODE`
+at `$8000`, `VECTORS` at `$FFFA`), run on a 6502 emulator. Watch
+`LOSS` (`$0304`).
 
-**AGC** — AGC assembly (yaAGC syntax). Assemble with yaAGC and run on an
-AGC emulator. The training loop runs 3 iterations (forward → backward).
+**AGC** — yaAGC syntax. Assemble with yaAGC, run on an AGC emulator.
 
-## Why ternary?
+## Honest status
 
-The 6502 has no multiply. The AGC has no multiply. A ternary weight
-(-1, 0, 1) turns a dot product into **add / subtract / skip**:
+**Written, not executed.** No 6502 or AGC emulator on the build VM.
+LayerNorm is omitted (documented). AGC embedding is frozen
+(documented). Do not claim it runs until it has been assembled,
+executed, and the loss decreases.
 
-- `W == 0` → skip the element entirely (sparsity = speed).
-- `W == 1` → add `X`.
-- `W == -1` → subtract `X`.
-
-No multiply instruction needed. That's the whole trick — and it's why
-a transformer fits on CPUs that were never meant to run one.
+Photo: MOS 6502 chip, via the CBM Museum (cbmmuseum.kuto.de).
 
 ## License
 
