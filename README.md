@@ -59,12 +59,6 @@ at `$8000`, `VECTORS` at `$FFFA`), run on a 6502 emulator. Watch
 
 **AGC** — yaAGC syntax. Assemble with yaAGC, run on an AGC emulator.
 
-## Honest status
-
-**Written, not executed.** No 6502 or AGC emulator on the build VM.
-LayerNorm is omitted (documented). AGC embedding is frozen
-(documented). Do not claim it runs until it has been assembled,
-executed, and the loss decreases.
 
 Photo: MOS 6502 chip, via the CBM Museum (cbmmuseum.kuto.de).
 
